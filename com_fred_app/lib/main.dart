@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_background_service/flutter_background_service.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -42,8 +44,265 @@ const List<String> frasesMemoria = [
   "Mas tarde", "Aqui", "Alli"
 ];
 
+// ================= FUNCIONES DE ARCHIVO FÍSICO PERMANENTE EN DISCO =================
+Future<File> _obtenerArchivoPermanente() async {
+  final dir = await getApplicationDocumentsDirectory();
+  return File('${dir.path}/comfred_datos_permanentes.json');
+}
+
+Future<Map<String, dynamic>> leerConfiguracionPermanente() async {
+  try {
+    final archivo = await _obtenerArchivoPermanente();
+    if (await archivo.exists()) {
+      final contenido = await archivo.readAsString();
+      if (contenido.trim().isNotEmpty) {
+        return jsonDecode(contenido) as Map<String, dynamic>;
+      }
+    }
+  } catch (_) {}
+
+  // Respaldo desde SharedPreferences si es la primera vez
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.reload();
+  List<int> botones = List.generate(10, (i) => prefs.getInt('btn_id_$i') ?? (i + 1));
+  List<String> grabadosStr = prefs.getStringList('audios_grabados_v2') ?? [];
+  List<dynamic> grabadosJson = grabadosStr.map((s) => jsonDecode(s)).toList();
+
+  return {
+    'nombrePersona': prefs.getString('nombrePersona') ?? "",
+    'carpetaSeleccionada': prefs.getInt('carpetaSeleccionada') ?? 1,
+    'codigoCaja': prefs.getString('codigoCaja') ?? "COMFRED_CRISTIAN_01",
+    'botonAudioId': botones,
+    'audiosPersonalizados': grabadosJson,
+  };
+}
+
+Future<void> guardarConfiguracionPermanente({
+  required String nombrePersona,
+  required int carpetaSeleccionada,
+  required String codigoCaja,
+  required List<int> botonAudioId,
+  required List<AudioPersonalizado> audiosPersonalizados,
+}) async {
+  final mapa = {
+    'nombrePersona': nombrePersona,
+    'carpetaSeleccionada': carpetaSeleccionada,
+    'codigoCaja': codigoCaja,
+    'botonAudioId': botonAudioId,
+    'audiosPersonalizados': audiosPersonalizados.map((a) => a.toJson()).toList(),
+  };
+
+  try {
+    final archivo = await _obtenerArchivoPermanente();
+    await archivo.writeAsString(jsonEncode(mapa), flush: true);
+  } catch (_) {}
+
+  final prefs = await SharedPreferences.getInstance();
+  await prefs.setString('nombrePersona', nombrePersona);
+  await prefs.setInt('carpetaSeleccionada', carpetaSeleccionada);
+  await prefs.setString('codigoCaja', codigoCaja);
+  for (int i = 0; i < 10; i++) {
+    await prefs.setInt('btn_id_$i', botonAudioId[i]);
+  }
+  await prefs.setStringList(
+    'audios_grabados_v2',
+    audiosPersonalizados.map((a) => jsonEncode(a.toJson())).toList(),
+  );
+}
+
+// ================= SERVICIO 24/7 QUE CORRE CON LA APLICACIÓN CERRADA =================
+@pragma('vm:entry-point')
+void servicioSegundoPlanoComFred(ServiceInstance service) async {
+  DartPluginRegistrant.ensureInitialized();
+
+  final FlutterLocalNotificationsPlugin notificaciones = FlutterLocalNotificationsPlugin();
+  const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+  await notificaciones.initialize(const InitializationSettings(android: androidInit));
+
+  final FlutterTts tts = FlutterTts();
+  final AudioPlayer reproductor = AudioPlayer();
+
+  try {
+    await tts.setEngine("com.google.android.tts");
+  } catch (_) {}
+  await tts.setLanguage("es-MX");
+  await tts.setVolume(1.0);
+
+  bool appEnPrimerPlano = false;
+  MqttServerClient? mqttBg;
+  DateTime ultimoEventoBg = DateTime.fromMillisecondsSinceEpoch(0);
+
+  service.on('estado_ui').listen((event) {
+    if (event != null && event['abierta'] != null) {
+      appEnPrimerPlano = event['abierta'] == true;
+    }
+  });
+
+  Future<void> hablarEnSegundoPlano(int idAudio, int genero, List<AudioPersonalizado> personalizados) async {
+    await reproductor.stop();
+    await tts.stop();
+    await reproductor.setVolume(1.0);
+    await tts.setVolume(1.0);
+
+    if (idAudio >= 101) {
+      final coincidencia = personalizados.where((a) => a.id == idAudio).toList();
+      if (coincidencia.isNotEmpty) {
+        final item = coincidencia.first;
+        if (!item.esTextoEscrito && item.rutaArchivo.isNotEmpty && File(item.rutaArchivo).existsSync()) {
+          await reproductor.play(DeviceFileSource(item.rutaArchivo));
+          return;
+        }
+        await tts.setPitch(genero == 1 ? 0.78 : 1.25);
+        await tts.setSpeechRate(0.48);
+        await tts.speak(item.titulo);
+        return;
+      }
+    }
+
+    if (idAudio >= 1 && idAudio < frasesMemoria.length) {
+      await tts.setPitch(genero == 1 ? 0.78 : 1.25);
+      await tts.setSpeechRate(0.48);
+      await tts.speak(frasesMemoria[idAudio]);
+    }
+  }
+
+  Future<void> conectarMqttSegundoPlano() async {
+    if (mqttBg != null && mqttBg!.connectionStatus?.state == MqttConnectionState.connected) {
+      return;
+    }
+
+    final config = await leerConfiguracionPermanente();
+    final String codigoCaja = (config['codigoCaja'] ?? "COMFRED_CRISTIAN_01").toString().trim();
+
+    try {
+      mqttBg?.disconnect();
+    } catch (_) {}
+
+    final clientId = 'ComFredBG_${DateTime.now().millisecondsSinceEpoch}';
+    mqttBg = MqttServerClient('broker.emqx.io', clientId);
+    mqttBg!.port = 1883;
+    mqttBg!.keepAlivePeriod = 30;
+    mqttBg!.autoReconnect = true;
+    mqttBg!.setProtocolV311();
+    mqttBg!.logging(on: false);
+
+    mqttBg!.onConnected = () {
+      mqttBg!.subscribe('$codigoCaja/evento', MqttQos.atLeastOnce);
+      mqttBg!.subscribe('$codigoCaja/bateria', MqttQos.atLeastOnce);
+    };
+
+    try {
+      await mqttBg!.connect();
+      mqttBg!.updates!.listen((List<MqttReceivedMessage<MqttMessage?>>? eventos) async {
+        if (eventos == null || eventos.isEmpty) return;
+
+        // Si la pantalla de la app está cerrada o en segundo plano, este servicio procesa todo:
+        if (appEnPrimerPlano) return;
+
+        final topico = eventos[0].topic;
+        final recMess = eventos[0].payload as MqttPublishMessage;
+        final payloadTexto = MqttPublishPayload.bytesToStringAsString(recMess.payload.message);
+
+        if (topico.endsWith('/evento')) {
+          final ahora = DateTime.now();
+          if (ahora.difference(ultimoEventoBg).inMilliseconds < 800) return;
+          ultimoEventoBg = ahora;
+
+          try {
+            final data = jsonDecode(payloadTexto);
+            int numBoton = int.tryParse(data['boton'].toString()) ?? 1;
+            if (numBoton < 1 || numBoton > 10) numBoton = 1;
+
+            // Lee los datos guardados en disco para respetar el nombre y los audios personalizados
+            final cfgActual = await leerConfiguracionPermanente();
+            final String nombreGuardado = (cfgActual['nombrePersona'] ?? "").toString().trim();
+            final String tituloAlerta = nombreGuardado.isEmpty ? "COM-FRED" : nombreGuardado;
+            final int genero = (cfgActual['carpetaSeleccionada'] ?? 1) as int;
+
+            List<int> botonesIds = List<int>.from(cfgActual['botonAudioId'] ?? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+            List<AudioPersonalizado> listaAudios = (cfgActual['audiosPersonalizados'] as List? ?? [])
+                .map((e) => AudioPersonalizado.fromJson(Map<String, dynamic>.from(e)))
+                .toList();
+
+            int idAudio = botonesIds[numBoton - 1];
+            String fraseTexto = "Audio #$idAudio";
+            if (idAudio >= 1 && idAudio < frasesMemoria.length) {
+              fraseTexto = frasesMemoria[idAudio];
+            } else {
+              final enc = listaAudios.where((a) => a.id == idAudio).toList();
+              if (enc.isNotEmpty) fraseTexto = enc.first.titulo;
+            }
+
+            const detallesAndroid = AndroidNotificationDetails(
+              'canal_comfred_urgente',
+              'Alertas COM-FRED',
+              channelDescription: 'Notificaciones sonoras con la app cerrada',
+              importance: Importance.max,
+              priority: Priority.high,
+              playSound: true,
+              enableVibration: true,
+              fullScreenIntent: true,
+            );
+            await notificaciones.show(
+              DateTime.now().millisecond,
+              "🚨 $tituloAlerta",
+              fraseTexto,
+              const NotificationDetails(android: detallesAndroid),
+            );
+
+            await hablarEnSegundoPlano(idAudio, genero, listaAudios);
+          } catch (_) {}
+        }
+      });
+    } catch (_) {}
+  }
+
+  // Conecta al arrancar y verifica cada 15 segundos que nunca se desconecte
+  await conectarMqttSegundoPlano();
+  Timer.periodic(const Duration(seconds: 15), (_) async {
+    await conectarMqttSegundoPlano();
+  });
+}
+
+Future<void> inicializarServicioPermanente() async {
+  final service = FlutterBackgroundService();
+
+  const AndroidNotificationChannel channel = AndroidNotificationChannel(
+    'canal_servicio_permanente',
+    'Monitoreo Continuo COM-FRED',
+    description: 'Mantiene la conexión automática las 24 horas',
+    importance: Importance.low,
+  );
+
+  final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+  await flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+      ?.createNotificationChannel(channel);
+
+  await service.configure(
+    androidConfiguration: AndroidConfiguration(
+      onStart: servicioSegundoPlanoComFred,
+      autoStart: true,
+      autoStartOnBoot: true,
+      isForegroundMode: true,
+      notificationChannelId: 'canal_servicio_permanente',
+      initialNotificationTitle: 'COM-FRED Activo',
+      initialNotificationContent: 'Conectado automáticamente para recibir alertas 24/7',
+      foregroundServiceNotificationId: 888,
+    ),
+    iosConfiguration: IosConfiguration(
+      autoStart: true,
+      onForeground: servicioSegundoPlanoComFred,
+    ),
+  );
+
+  await service.startService();
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await inicializarServicioPermanente();
   runApp(const ComFredApp());
 }
 
@@ -61,12 +320,11 @@ class ComFredApp extends StatelessWidget {
   }
 }
 
-// Modelo que soporta tanto audios grabados con micrófono como frases escritas (TTS)
 class AudioPersonalizado {
   final int id;
   final String titulo;
   final String rutaArchivo;
-  final bool esTextoEscrito; // true = Frase escrita leída por voz, false = Grabación de micrófono
+  final bool esTextoEscrito;
 
   AudioPersonalizado({
     required this.id,
@@ -97,11 +355,13 @@ class PantallaComFred extends StatefulWidget {
   State<PantallaComFred> createState() => _PantallaComFredState();
 }
 
-class _PantallaComFredState extends State<PantallaComFred> {
+class _PantallaComFredState extends State<PantallaComFred> with WidgetsBindingObserver {
   int _pestanaActual = 0;
   String _textoBusqueda = "";
 
-  // 1 = Voz Hombre (Carpeta 01 / Azul), 2 = Voz Mujer (Carpeta 02 / Rosa)
+  String _nombrePersona = "";
+  final TextEditingController _ctrlNombrePersona = TextEditingController();
+
   int _carpetaSeleccionada = 1;
 
   Map<String, String>? _vozMasculinaSistema;
@@ -113,7 +373,6 @@ class _PantallaComFredState extends State<PantallaComFred> {
   List<int> _botonAudioId = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
   List<int> _botonCarpeta = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
 
-  // Lista permanente de audios personalizados (escritos y grabados con voz)
   List<AudioPersonalizado> _audiosPersonalizados = [];
 
   final FlutterTts _tts = FlutterTts();
@@ -128,13 +387,12 @@ class _PantallaComFredState extends State<PantallaComFred> {
   final TextEditingController _ctrlWifiSsid = TextEditingController();
   final TextEditingController _ctrlWifiPass = TextEditingController();
 
-  // CONEXIÓN 1 (PRINCIPAL): INTERNET / NUBE MQTT
   MqttServerClient? _mqttClient;
   bool _appConectadaANube = false;
   bool _cajaTieneInternet = false;
   String _estadoInternetCaja = "Verificando conexión a Internet de la botonera...";
+  Timer? _timerReconexionAutomatica;
 
-  // CONEXIÓN 2 (RESPALDO): BLUETOOTH BLE
   BluetoothDevice? _dispositivoBle;
   BluetoothCharacteristic? _bleWriteChar;
   StreamSubscription? _scanSubscription;
@@ -147,14 +405,36 @@ class _PantallaComFredState extends State<PantallaComFred> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    FlutterBackgroundService().invoke('estado_ui', {'abierta': true});
     _iniciarServicios();
   }
 
+  @override
+  void dispose() {
+    FlutterBackgroundService().invoke('estado_ui', {'abierta': false});
+    _timerReconexionAutomatica?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      FlutterBackgroundService().invoke('estado_ui', {'abierta': true});
+      _cargarDatosGuardados();
+      if (!_appConectadaANube) _conectarNubeMQTT();
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached ||
+        state == AppLifecycleState.inactive) {
+      // Al minimizar o cerrar la app, el servicio 24/7 toma el control inmediato
+      FlutterBackgroundService().invoke('estado_ui', {'abierta': false});
+    }
+  }
+
   Future<void> _iniciarServicios() async {
-    // 1. Primero cargamos todos los audios y botones guardados en memoria permanente
     await _cargarDatosGuardados();
 
-    // 2. Pedimos permisos y configuramos notificaciones y motor de voz
     await [
       Permission.notification,
       Permission.microphone,
@@ -167,8 +447,19 @@ class _PantallaComFredState extends State<PantallaComFred> {
     await _iniciarNotificaciones();
     await _iniciarMotorVozYGeneros();
 
-    // 3. Conectamos a Internet automáticamente
+    // 1. Conecta automáticamente por Internet
     _conectarNubeMQTT();
+
+    // 2. Intenta conectar automáticamente por Bluetooth por si no hubiera Internet
+    _conectarBluetoothBLE();
+
+    // 3. Vigilante automático: si se cae el internet del teléfono, reconecta solo cada 10s
+    _timerReconexionAutomatica = Timer.periodic(const Duration(seconds: 10), (_) {
+      if (!_appConectadaANube ||
+          _mqttClient?.connectionStatus?.state != MqttConnectionState.connected) {
+        _conectarNubeMQTT();
+      }
+    });
   }
 
   Future<void> _iniciarNotificaciones() async {
@@ -286,8 +577,9 @@ class _PantallaComFredState extends State<PantallaComFred> {
 
     if (nuevoNivel <= 15 && !_alertaBateriaBajaEnviada) {
       _alertaBateriaBajaEnviada = true;
+      String nombreActual = _obtenerNombreAMostrar();
       _lanzarNotificacion(
-        "⚠️ Batería Baja en COM-FRED",
+        "⚠️ Batería Baja: $nombreActual",
         "El dispositivo tiene $nuevoNivel% de batería. Conéctalo a cargar.",
       );
     } else if (nuevoNivel > 20) {
@@ -295,7 +587,10 @@ class _PantallaComFredState extends State<PantallaComFred> {
     }
   }
 
-  // Se dispara cuando se presiona un botón físico o del tablero
+  String _obtenerNombreAMostrar() {
+    return _nombrePersona.trim().isEmpty ? "COM-FRED" : _nombrePersona.trim();
+  }
+
   void _procesarBotonRecibido(int numBoton, String origen) {
     final ahora = DateTime.now();
     if (origen != "Tablero App" && ahora.difference(_ultimoDisparoVoz).inMilliseconds < 800) return;
@@ -303,24 +598,21 @@ class _PantallaComFredState extends State<PantallaComFred> {
 
     if (numBoton < 1 || numBoton > 10) numBoton = 1;
 
-    // SIEMPRE respeta el audio que el usuario guardó en la aplicación para ese botón
     int idAudio = _botonAudioId[numBoton - 1];
     int generoReproduccion = _carpetaSeleccionada;
-
     String textoFrase = _obtenerTextoPorId(idAudio);
-    String etiquetaTipo = _obtenerEtiquetaTipoAudio(idAudio);
+    String nombreActual = _obtenerNombreAMostrar();
 
     if (mounted) {
       setState(() {
-        _estadoUltimoEvento = "[$origen] Botón $numBoton: \"$textoFrase\" ($etiquetaTipo)";
+        _estadoUltimoEvento = "$nombreActual: \"$textoFrase\"";
       });
     }
 
-    _lanzarNotificacion("🚨 COM-FRED (Botón $numBoton)", "$textoFrase ($etiquetaTipo)");
+    _lanzarNotificacion("🚨 $nombreActual", textoFrase);
     _reproducirAudioEnMovilYAltavoz(idAudio, generoReproduccion);
   }
 
-  // Reproduce el audio (Base 1-100, Escrito 101+ o Grabado con voz 101+) en celular y altavoz inteligente
   Future<void> _reproducirAudioEnMovilYAltavoz(int idAudio, int genero) async {
     await _reproductor.stop();
     await _tts.stop();
@@ -328,12 +620,12 @@ class _PantallaComFredState extends State<PantallaComFred> {
 
     String fraseParaAltavoz = _obtenerTextoPorId(idAudio);
 
-    // Publica el texto exacto en el canal de voz para que el Altavoz Inteligente también lo pronuncie
     if (_mqttClient != null && _appConectadaANube) {
       final builder = MqttClientPayloadBuilder();
       builder.addString(jsonEncode({
         'id': idAudio,
         'texto': fraseParaAltavoz,
+        'persona': _obtenerNombreAMostrar(),
         'genero': genero == 1 ? 'hombre' : 'mujer',
       }));
       _mqttClient!.publishMessage(
@@ -343,24 +635,20 @@ class _PantallaComFredState extends State<PantallaComFred> {
       );
     }
 
-    // Si es un audio personalizado (#101 en adelante)
     if (idAudio >= 101) {
       final coincidencia = _audiosPersonalizados.where((a) => a.id == idAudio).toList();
       if (coincidencia.isNotEmpty) {
         final item = coincidencia.first;
-        // Caso A: Fue grabado con el micrófono y existe el archivo de voz
         if (!item.esTextoEscrito && item.rutaArchivo.isNotEmpty && File(item.rutaArchivo).existsSync()) {
           await _reproductor.play(DeviceFileSource(item.rutaArchivo));
           return;
         }
-        // Caso B: Es un audio creado solo escribiendo el texto -> Lo lee el sintetizador con voz Hombre/Mujer
         await _aplicarVozPorGenero(_carpetaSeleccionada);
         await _tts.speak(item.titulo);
         return;
       }
     }
 
-    // Si es una de las 100 frases de memoria (1 al 100)
     if (idAudio >= 1 && idAudio < frasesMemoria.length) {
       String frase = frasesMemoria[idAudio];
       await _aplicarVozPorGenero(_carpetaSeleccionada);
@@ -383,26 +671,23 @@ class _PantallaComFredState extends State<PantallaComFred> {
     }
   }
 
-  // Sincroniza todas las asignaciones guardadas en la app hacia el ESP32
-  void _sincronizarTodosLosBotonesConESP32() {
-    _enviarComandoAlESP32("GEN:$_carpetaSeleccionada");
-    for (int i = 0; i < 10; i++) {
-      _enviarComandoAlESP32("MAP:${i + 1}=${_botonAudioId[i]},$_carpetaSeleccionada");
-    }
-  }
-
-  // ================= CONEXIÓN 1 (PRINCIPAL): INTERNET MQTT =================
   Future<void> _conectarNubeMQTT() async {
+    if (_mqttClient != null &&
+        _mqttClient!.connectionStatus?.state == MqttConnectionState.connected) {
+      if (mounted) setState(() => _appConectadaANube = true);
+      return;
+    }
+
     try {
-      if (_mqttClient != null) _mqttClient!.disconnect();
+      _mqttClient?.disconnect();
     } catch (_) {}
 
-    final clientId = 'ComFredApp_${DateTime.now().millisecondsSinceEpoch}';
+    final clientId = 'ComFredUI_${DateTime.now().millisecondsSinceEpoch}';
     _mqttClient = MqttServerClient('broker.emqx.io', clientId);
     _mqttClient!.port = 1883;
     _mqttClient!.keepAlivePeriod = 30;
     _mqttClient!.autoReconnect = true;
-    _mqttClient!.setProtocolV311(); // Asegura conexión inmediata en redes móviles y Wi-Fi
+    _mqttClient!.setProtocolV311();
     _mqttClient!.logging(on: false);
 
     _mqttClient!.onConnected = () {
@@ -461,8 +746,8 @@ class _PantallaComFredState extends State<PantallaComFred> {
     }
   }
 
-  // ================= CONEXIÓN 2 (RESPALDO): BLUETOOTH BLE =================
   Future<void> _conectarBluetoothBLE() async {
+    if (_bleConectado || _buscandoBle) return;
     setState(() => _buscandoBle = true);
     try {
       await _scanSubscription?.cancel();
@@ -511,13 +796,7 @@ class _PantallaComFredState extends State<PantallaComFred> {
           }
         }
       });
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Error Bluetooth: $e")),
-        );
-      }
-    }
+    } catch (_) {}
     Future.delayed(const Duration(seconds: 6), () {
       if (mounted) setState(() => _buscandoBle = false);
     });
@@ -595,52 +874,43 @@ class _PantallaComFredState extends State<PantallaComFred> {
     return "Audio #$id";
   }
 
-  String _obtenerEtiquetaTipoAudio(int id) {
-    if (id >= 101) {
-      final encontrado = _audiosPersonalizados.where((a) => a.id == id).toList();
-      if (encontrado.isNotEmpty) {
-        return encontrado.first.esTextoEscrito
-            ? (_carpetaSeleccionada == 1 ? "✍️ Escrito - Voz Hombre" : "✍️ Escrito - Voz Mujer")
-            : "🎙️ Voz Grabada";
-      }
-      return "Personalizado";
-    }
-    return _carpetaSeleccionada == 1 ? "👨 Voz Hombre" : "👩 Voz Mujer";
-  }
-
-  // ================= GUARDADO Y CARGA PERMANENTE (NUNCA SE BORRA AL CERRAR LA APP) =================
+  // Carga los datos desde el archivo permanente en disco
   Future<void> _cargarDatosGuardados() async {
-    final prefs = await SharedPreferences.getInstance();
-    final grabadosStr = prefs.getStringList('audios_grabados_v2') ??
-        prefs.getStringList('audios_grabados') ??
-        [];
-
-    List<AudioPersonalizado> cargados = [];
-    for (String s in grabadosStr) {
-      try {
-        cargados.add(AudioPersonalizado.fromJson(jsonDecode(s)));
-      } catch (_) {}
-    }
+    final cfg = await leerConfiguracionPermanente();
+    final List<AudioPersonalizado> cargados = (cfg['audiosPersonalizados'] as List? ?? [])
+        .map((e) => AudioPersonalizado.fromJson(Map<String, dynamic>.from(e)))
+        .toList();
+    final List<int> botones = List<int>.from(cfg['botonAudioId'] ?? [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
     if (mounted) {
       setState(() {
-        _carpetaSeleccionada = prefs.getInt('carpetaSeleccionada') ?? 1;
-        _ctrlCodigoCaja.text = prefs.getString('codigoCaja') ?? "COMFRED_CRISTIAN_01";
-        _audiosPersonalizados = cargados;
-        for (int i = 0; i < 10; i++) {
-          _botonAudioId[i] = prefs.getInt('btn_id_$i') ?? (i + 1);
-          _botonCarpeta[i] = prefs.getInt('btn_carpeta_$i') ?? _carpetaSeleccionada;
+        _nombrePersona = (cfg['nombrePersona'] ?? "").toString();
+        if (_ctrlNombrePersona.text != _nombrePersona) {
+          _ctrlNombrePersona.text = _nombrePersona;
         }
+        _carpetaSeleccionada = (cfg['carpetaSeleccionada'] ?? 1) as int;
+        _ctrlCodigoCaja.text = (cfg['codigoCaja'] ?? "COMFRED_CRISTIAN_01").toString();
+        _audiosPersonalizados = cargados;
+        _botonAudioId = botones;
       });
     }
   }
 
-  Future<void> _guardarListaAudiosEnMemoriaPermanente() async {
-    final prefs = await SharedPreferences.getInstance();
-    final List<String> serializados =
-        _audiosPersonalizados.map((a) => jsonEncode(a.toJson())).toList();
-    await prefs.setStringList('audios_grabados_v2', serializados);
-    await prefs.setStringList('audios_grabados', serializados);
+  Future<void> _sincronizarTodoEnDisco() async {
+    await guardarConfiguracionPermanente(
+      nombrePersona: _nombrePersona,
+      carpetaSeleccionada: _carpetaSeleccionada,
+      codigoCaja: _ctrlCodigoCaja.text.trim(),
+      botonAudioId: _botonAudioId,
+      audiosPersonalizados: _audiosPersonalizados,
+    );
+  }
+
+  Future<void> _guardarNombrePersona(String valor) async {
+    setState(() {
+      _nombrePersona = valor.trim();
+    });
+    await _sincronizarTodoEnDisco();
   }
 
   int _calcularSiguienteIdDisponible() {
@@ -651,7 +921,6 @@ class _PantallaComFredState extends State<PantallaComFred> {
     return maxId + 1;
   }
 
-  // NUEVA FUNCIÓN: Guardar un audio únicamente escribiendo el texto (sin grabar micrófono)
   Future<void> _guardarFraseSoloEscrita() async {
     final texto = _ctrlNombreGrabacion.text.trim();
     if (texto.isEmpty) {
@@ -674,19 +943,16 @@ class _PantallaComFredState extends State<PantallaComFred> {
       _ctrlNombreGrabacion.clear();
     });
 
-    await _guardarListaAudiosEnMemoriaPermanente();
-
-    // Lo reproduce inmediatamente con la voz activa para que escuches cómo quedó
+    await _sincronizarTodoEnDisco();
     _reproducirAudioEnMovilYAltavoz(nuevoId, _carpetaSeleccionada);
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("✅ Frase #$nuevoId guardada permanentemente y lista para usar")),
+        const SnackBar(content: Text("✅ Frase guardada permanentemente en memoria")),
       );
     }
   }
 
-  // Función para grabar con el micrófono del celular
   Future<void> _alternarGrabacionVoz() async {
     if (!_grabandoAhora) {
       if (_ctrlNombreGrabacion.text.trim().isEmpty) {
@@ -719,12 +985,12 @@ class _PantallaComFredState extends State<PantallaComFred> {
           _audiosPersonalizados.add(nuevo);
           _ctrlNombreGrabacion.clear();
         });
-        await _guardarListaAudiosEnMemoriaPermanente();
+        await _sincronizarTodoEnDisco();
         _reproducirAudioEnMovilYAltavoz(nuevoId, 3);
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("🎙️ Voz grabada y guardada permanentemente en #$nuevoId")),
+            const SnackBar(content: Text("🎙️ Audio grabado y guardado permanentemente")),
           );
         }
       }
@@ -737,13 +1003,10 @@ class _PantallaComFredState extends State<PantallaComFred> {
     setState(() {
       _botonAudioId[idx] = idAudio;
       _botonCarpeta[idx] = carpeta;
-      _estadoUltimoEvento = "Botón $numeroBoton1a10 actualizado ➡️ \"${_obtenerTextoPorId(idAudio)}\"";
+      _estadoUltimoEvento = "${_obtenerNombreAMostrar()}: \"${_obtenerTextoPorId(idAudio)}\"";
     });
 
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt('btn_id_$idx', idAudio);
-    await prefs.setInt('btn_carpeta_$idx', carpeta);
-
+    await _sincronizarTodoEnDisco();
     _reproducirAudioEnMovilYAltavoz(idAudio, _carpetaSeleccionada);
     _enviarComandoAlESP32("MAP:$numeroBoton1a10=$idAudio,$_carpetaSeleccionada");
   }
@@ -817,11 +1080,6 @@ class _PantallaComFredState extends State<PantallaComFred> {
                 style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                 textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 4),
-              Text(
-                _obtenerEtiquetaTipoAudio(idAudio),
-                style: const TextStyle(fontSize: 13, color: Colors.blueGrey, fontWeight: FontWeight.w600),
-              ),
               const SizedBox(height: 16),
               _construirRectanguloBotonesAmarillos(
                 alPresionarBoton: (numBoton) {
@@ -829,7 +1087,7 @@ class _PantallaComFredState extends State<PantallaComFred> {
                   _asignarAudioABotonFisico(numBoton, idAudio, carpeta);
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
-                      content: Text("✅ Botón $numBoton cambiado permanentemente a: \"$frase\""),
+                      content: Text("✅ Guardado permanentemente en el botón $numBoton"),
                       duration: const Duration(seconds: 2),
                     ),
                   );
@@ -887,44 +1145,49 @@ class _PantallaComFredState extends State<PantallaComFred> {
   @override
   Widget build(BuildContext context) {
     final Color colorFondoDinamico = _carpetaSeleccionada == 2
-        ? const Color(0xFFF8BBD0) // Rosa para Mujer
-        : const Color(0xFFAEEEEE); // Azul Menta para Hombre
+        ? const Color(0xFFF8BBD0) // Rosa
+        : const Color(0xFFAEEEEE); // Azul Menta
+
+    final String nombreParaTitulo = _obtenerNombreAMostrar();
 
     return Scaffold(
       backgroundColor: colorFondoDinamico,
       body: SafeArea(
         child: Column(
           children: [
-            // ENCABEZADO SUPERIOR CON BATERÍA FIJA EN TODAS LAS PESTAÑAS
             Padding(
               padding: const EdgeInsets.only(top: 10.0, bottom: 4.0, left: 16.0, right: 16.0),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   const SizedBox(width: 68),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Text("🤖 ", style: TextStyle(fontSize: 24)),
-                      Text(
-                        "COM-FRED",
-                        style: TextStyle(
-                          fontSize: 25,
-                          fontWeight: FontWeight.bold,
-                          fontStyle: FontStyle.italic,
-                          color: _carpetaSeleccionada == 2 ? const Color(0xFFC2185B) : const Color(0xFFF06292),
-                          letterSpacing: 1.1,
+                  Expanded(
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Text("🤖 ", style: TextStyle(fontSize: 22)),
+                        Flexible(
+                          child: Text(
+                            nombreParaTitulo,
+                            style: TextStyle(
+                              fontSize: 23,
+                              fontWeight: FontWeight.bold,
+                              fontStyle: FontStyle.italic,
+                              color: _carpetaSeleccionada == 2 ? const Color(0xFFC2185B) : const Color(0xFFF06292),
+                              letterSpacing: 1.1,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
-                      ),
-                      const Text(" 🐻", style: TextStyle(fontSize: 24)),
-                    ],
+                        const Text(" 🐻", style: TextStyle(fontSize: 22)),
+                      ],
+                    ),
                   ),
                   _construirIndicadorBateria(),
                 ],
               ),
             ),
 
-            // BARRA DE ESTADO EN TODAS LAS PESTAÑAS
             Container(
               margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -943,17 +1206,17 @@ class _PantallaComFredState extends State<PantallaComFred> {
                           Icon(
                             Icons.public,
                             size: 15,
-                            color: _appConectadaANube ? Colors.green.shade700 : Colors.red,
+                            color: _appConectadaANube ? Colors.green.shade700 : Colors.orange,
                           ),
                           const SizedBox(width: 4),
                           Text(
                             _appConectadaANube
-                                ? (_cajaTieneInternet ? "Internet: En Línea" : "Internet: App Lista")
-                                : "Sin Internet",
+                                ? (_cajaTieneInternet ? "Internet: En Línea (24/7)" : "Internet: Automático 24/7")
+                                : "Reconectando...",
                             style: TextStyle(
                               fontSize: 12,
                               fontWeight: FontWeight.bold,
-                              color: _appConectadaANube ? Colors.green.shade800 : Colors.red.shade800,
+                              color: _appConectadaANube ? Colors.green.shade800 : Colors.orange.shade900,
                             ),
                           ),
                         ],
@@ -991,7 +1254,6 @@ class _PantallaComFredState extends State<PantallaComFred> {
               ),
             ),
 
-            // CONTENIDO DE LAS 4 PESTAÑAS
             Expanded(
               child: IndexedStack(
                 index: _pestanaActual,
@@ -1024,11 +1286,9 @@ class _PantallaComFredState extends State<PantallaComFred> {
     );
   }
 
-  // ---------------- PESTAÑA 1: CATÁLOGO (100 BASE + ESCRITOS + GRABADOS) ----------------
   Widget _vistaCatalogoPrototipo() {
     List<Map<String, dynamic>> itemsFiltrados = [];
 
-    // Primero mostramos los audios personalizados (escritos y grabados) si coinciden con la búsqueda
     for (var g in _audiosPersonalizados.reversed) {
       if (g.titulo.toLowerCase().contains(_textoBusqueda.toLowerCase()) ||
           g.id.toString().contains(_textoBusqueda)) {
@@ -1042,7 +1302,6 @@ class _PantallaComFredState extends State<PantallaComFred> {
       }
     }
 
-    // Luego las 100 frases base de memoria
     for (int i = 1; i < frasesMemoria.length; i++) {
       final frase = frasesMemoria[i];
       if (frase.toLowerCase().contains(_textoBusqueda.toLowerCase()) ||
@@ -1083,8 +1342,7 @@ class _PantallaComFredState extends State<PantallaComFred> {
                             if (_botonAudioId[i] <= 100) _botonCarpeta[i] = 1;
                           }
                         });
-                        final prefs = await SharedPreferences.getInstance();
-                        await prefs.setInt('carpetaSeleccionada', 1);
+                        await _sincronizarTodoEnDisco();
                         _enviarComandoAlESP32("GEN:1");
                         _reproducirAudioEnMovilYAltavoz(1, 1);
                       },
@@ -1103,8 +1361,7 @@ class _PantallaComFredState extends State<PantallaComFred> {
                             if (_botonAudioId[i] <= 100) _botonCarpeta[i] = 2;
                           }
                         });
-                        final prefs = await SharedPreferences.getInstance();
-                        await prefs.setInt('carpetaSeleccionada', 2);
+                        await _sincronizarTodoEnDisco();
                         _enviarComandoAlESP32("GEN:2");
                         _reproducirAudioEnMovilYAltavoz(1, 2);
                       },
@@ -1187,7 +1444,6 @@ class _PantallaComFredState extends State<PantallaComFred> {
     );
   }
 
-  // ---------------- PESTAÑA 2: TABLERO 1 AL 10 ----------------
   Widget _vistaTableroAmarillo() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
@@ -1199,12 +1455,12 @@ class _PantallaComFredState extends State<PantallaComFred> {
             child: Column(
               children: [
                 const Text(
-                  "Disposición de la Caja COM-FRED",
+                  "Disposición de la Caja",
                   style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
                 ),
                 const SizedBox(height: 4),
                 const Text(
-                  "Toca cualquier botón amarillo (1 al 10) para escuchar su audio asignado.",
+                  "Toca cualquier botón amarillo (1 al 10) para escuchar su frase asignada.",
                   textAlign: TextAlign.center,
                   style: TextStyle(fontSize: 13, color: Colors.black54),
                 ),
@@ -1250,10 +1506,6 @@ class _PantallaComFredState extends State<PantallaComFred> {
                             "#$idAudio: ${_obtenerTextoPorId(idAudio)}",
                             style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
                           ),
-                          Text(
-                            _obtenerEtiquetaTipoAudio(idAudio),
-                            style: const TextStyle(fontSize: 12, color: Colors.blueGrey),
-                          ),
                         ],
                       ),
                     ),
@@ -1268,7 +1520,6 @@ class _PantallaComFredState extends State<PantallaComFred> {
     );
   }
 
-  // ---------------- PESTAÑA 3: AGREGAR AUDIO ESCRITO O GRABADO CON VOZ (#101+) ----------------
   Widget _vistaGrabarOEscribirAudio() {
     return Padding(
       padding: const EdgeInsets.all(16.0),
@@ -1280,12 +1531,12 @@ class _PantallaComFredState extends State<PantallaComFred> {
             child: Column(
               children: [
                 const Text(
-                  "Agregar Nuevo Audio (Escrito o Grabado)",
+                  "Agregar Nuevo Audio",
                   style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
                 ),
                 const SizedBox(height: 6),
                 const Text(
-                  "Escribe la frase y guárdala directamente como voz automática o grábala con tu propia voz. Quedan guardados permanentemente.",
+                  "Escribe la frase y guárdala con voz automática o grábala con tu micrófono. Quedan guardados permanentemente aunque cierres la app.",
                   textAlign: TextAlign.center,
                   style: TextStyle(fontSize: 12.5, color: Colors.black54),
                 ),
@@ -1293,14 +1544,12 @@ class _PantallaComFredState extends State<PantallaComFred> {
                 TextField(
                   controller: _ctrlNombreGrabacion,
                   decoration: InputDecoration(
-                    labelText: "Escribe aquí la frase que deseas que diga...",
-                    prefixIcon: const Icon(Icons.record_voice_over),
+                    labelText: "Escribe aquí la frase que deseas agregar...",
+                    prefixIcon: const Icon(Icons.edit_note),
                     border: OutlineInputBorder(borderRadius: BorderRadius.circular(14)),
                   ),
                 ),
                 const SizedBox(height: 12),
-
-                // BOTÓN 1: GUARDAR SOLO ESCRIBIENDO EL TEXTO (SIN USAR MICRÓFONO)
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton.icon(
@@ -1319,8 +1568,6 @@ class _PantallaComFredState extends State<PantallaComFred> {
                   ),
                 ),
                 const SizedBox(height: 8),
-
-                // BOTÓN 2: GRABAR CON TU PROPIA VOZ USANDO EL MICRÓFONO
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton.icon(
@@ -1344,7 +1591,7 @@ class _PantallaComFredState extends State<PantallaComFred> {
           const SizedBox(height: 12),
           Expanded(
             child: _audiosPersonalizados.isEmpty
-                ? const Center(child: Text("Aún no has agregado audios escritos ni grabados (#101+)."))
+                ? const Center(child: Text("Aún no has agregado frases nuevas (#101+)."))
                 : ListView.builder(
                     itemCount: _audiosPersonalizados.length,
                     itemBuilder: (ctx, i) {
@@ -1366,9 +1613,7 @@ class _PantallaComFredState extends State<PantallaComFred> {
                             style: const TextStyle(fontWeight: FontWeight.bold),
                           ),
                           subtitle: Text(
-                            audio.esTextoEscrito
-                                ? "✍️ Frase Escrita (Suena con voz Hombre/Mujer)"
-                                : "🎙️ Grabado con tu voz",
+                            audio.esTextoEscrito ? "Frase Escrita" : "Nota de Voz",
                             style: const TextStyle(fontSize: 12),
                           ),
                           trailing: ElevatedButton(
@@ -1389,12 +1634,12 @@ class _PantallaComFredState extends State<PantallaComFred> {
     );
   }
 
-  // ---------------- PESTAÑA 4: TEXTOS PERSONALIZADOS CONSERVADOS ----------------
   Widget _vistaRedYBluetooth() {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16.0),
       child: Column(
         children: [
+          // SECCIÓN 0: NOMBRE DE LA PERSONA CON GUARDADO PERMANENTE
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
@@ -1402,12 +1647,71 @@ class _PantallaComFredState extends State<PantallaComFred> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  "1. Conexión por Internet (Vía Principal)",
+                  "Nombre de la Persona (Botonera)",
                   style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
                 ),
                 const SizedBox(height: 6),
                 const Text(
-                  "Con esta conexión escuchas los audios en el celular desde cualquier lugar",
+                  "Escribe el nombre de quien usará la botonera. Si lo dejas vacío, se mostrará COM-FRED por defecto.",
+                  style: TextStyle(fontSize: 13, color: Colors.black54),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _ctrlNombrePersona,
+                  onChanged: (val) => _guardarNombrePersona(val),
+                  decoration: InputDecoration(
+                    labelText: "Nombre de la persona (Ej: Mamá, Abuelito)",
+                    prefixIcon: const Icon(Icons.person),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFFFEB3B),
+                      foregroundColor: Colors.black87,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                    onPressed: () async {
+                      await _guardarNombrePersona(_ctrlNombrePersona.text);
+                      if (mounted) {
+                        FocusScope.of(context).unfocus();
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text("✅ Nombre '${_obtenerNombreAMostrar()}' guardado permanentemente"),
+                          ),
+                        );
+                      }
+                    },
+                    icon: const Icon(Icons.save),
+                    label: const Text(
+                      "Guardar Nombre Permanentemente",
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+
+          // SECCIÓN 1: CONEXIÓN AUTOMÁTICA POR INTERNET
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  "1. Conexión por Internet (Automática 24/7)",
+                  style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  "La aplicación se mantiene conectada automáticamente en segundo plano aunque la cierres por completo.",
                   style: TextStyle(fontSize: 13, color: Colors.black54),
                 ),
                 const SizedBox(height: 10),
@@ -1431,33 +1735,12 @@ class _PantallaComFredState extends State<PantallaComFred> {
                     ),
                   ),
                 ),
-                const SizedBox(height: 10),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF0288D1),
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 13),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                    ),
-                    onPressed: () {
-                      _conectarNubeMQTT();
-                      _sincronizarTodosLosBotonesConESP32();
-                    },
-                    icon: const Icon(Icons.public),
-                    label: Text(
-                      _appConectadaANube
-                          ? "🌐 Conectado por Internet (Toca para sincronizar)"
-                          : "Conectar por Internet Ahora",
-                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-                    ),
-                  ),
-                ),
               ],
             ),
           ),
           const SizedBox(height: 14),
+
+          // SECCIÓN 2: CAMBIAR RED WI-FI
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
@@ -1513,6 +1796,8 @@ class _PantallaComFredState extends State<PantallaComFred> {
             ),
           ),
           const SizedBox(height: 14),
+
+          // SECCIÓN 3: RESPALDO POR BLUETOOTH
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(20)),
